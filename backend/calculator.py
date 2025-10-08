@@ -25,7 +25,8 @@ class AuctionValueCalculator:
         league_teams: int = 12,
         roster_size: int = 13,
         budget: int = 200,
-        adp_weight: float = 0.5  # How much to weight ADP vs z-scores in value calc
+        adp_weight: float = 0.5,  # How much to weight ADP vs z-scores in value calc
+        min_games: int = 30  # Minimum games required for consideration
     ) -> List[Dict]:
         if not players:
             return []
@@ -33,6 +34,9 @@ class AuctionValueCalculator:
         punted_cats = punted_cats or []
         category_weights = category_weights or {}
         df = pd.DataFrame(players)
+
+        # Filter out players with too few games
+        df = df[df['games'] >= min_games].copy()
 
         df = self._clean_positions(df)
 
@@ -53,9 +57,22 @@ class AuctionValueCalculator:
             df, league_teams, budget
         )
 
+        # Calculate punt aggressiveness (how much we're deviating from standard)
+        punt_factor = 0
+        for weight in category_weights.values():
+            if weight == 0:
+                punt_factor += 0.3  # Strong punt
+            elif weight < 0.5:
+                punt_factor += 0.15  # De-emphasis
+            elif weight > 1.5:
+                punt_factor += 0.1  # Strong emphasis
+
+        # Reduce ADP influence when punting (use more z-scores)
+        adjusted_adp_weight = max(0.2, adp_weight * (1 - min(0.5, punt_factor)))
+
         # Blend the two value systems
         values = self._blend_values(
-            z_score_values, adp_values, df, adp_weight
+            z_score_values, adp_values, df, adjusted_adp_weight
         )
 
         if inflation_rate > 0:
@@ -101,17 +118,17 @@ class AuctionValueCalculator:
 
             if adp_rank and adp_rank <= 200:  # Only blend if we have real ADP data
                 if adp_rank <= 20:
-                    # Top 20: 70% ADP, 30% calculated
-                    blend_weight = 0.7
-                elif adp_rank <= 50:
-                    # Top 50: 60% ADP, 40% calculated
-                    blend_weight = 0.6
-                elif adp_rank <= 100:
-                    # Top 100: 50% ADP, 50% calculated
-                    blend_weight = 0.5
+                    # Top 20: 35% ADP, 65% calculated
+                    blend_weight = 0.35
+                elif adp_rank <= 40:
+                    # Top 40: 20% ADP, 80% calculated
+                    blend_weight = 0.20
+                elif adp_rank <= 60:
+                    # Top 60: 10% ADP, 90% calculated
+                    blend_weight = 0.10
                 else:
-                    # Beyond 100: 40% ADP, 60% calculated
-                    blend_weight = 0.4
+                    # Beyond 60: 0% ADP, 100% calculated
+                    blend_weight = 0.0
 
                 player['blend_rank'] = (adp_rank * blend_weight) + (value_rank * (1 - blend_weight))
             else:
@@ -181,20 +198,29 @@ class AuctionValueCalculator:
                 continue
 
             if cat in self.counting_cats:
-                col_name = f'total_{cat}'
-                if col_name in df.columns:
-                    values = df[col_name]
+                # Use per-game averages instead of totals
+                # This ensures fair comparison regardless of games played
+                if cat in df.columns:
+                    values = df[cat]  # Already per-game
                 else:
-                    values = df[cat] * df['games']
+                    # Convert totals to per-game if needed
+                    col_name = f'total_{cat}'
+                    if col_name in df.columns:
+                        values = df[col_name] / df['games']
+                    else:
+                        values = df.get(cat, 0)
             elif cat == 'fg_pct':
                 values = df['fg_pct_weighted']
             elif cat == 'ft_pct':
                 values = df['ft_pct_weighted']
             elif cat == 'turnovers':
-                if 'total_turnovers' in df.columns:
-                    values = -df['total_turnovers']
+                # Use per-game turnovers (negative impact)
+                if 'turnovers' in df.columns:
+                    values = -df['turnovers']  # Already per-game
+                elif 'total_turnovers' in df.columns:
+                    values = -(df['total_turnovers'] / df['games'])
                 else:
-                    values = -(df['turnovers'] * df['games'])
+                    values = -df.get('turnovers', 0)
             else:
                 values = df[cat]
 
@@ -204,9 +230,25 @@ class AuctionValueCalculator:
             if std_val > 0:
                 # Calculate raw z-score
                 raw_z = (values - mean_val) / std_val
+
+                # Apply non-linear scaling for punts (exponential scaling)
+                # This makes punt decisions more impactful
+                if weight == 0:
+                    # Completely punted - severe penalty for good performance
+                    weighted_z = raw_z * -0.5 if raw_z > 0 else 0
+                elif weight < 0.5:
+                    # De-emphasized - exponential penalty
+                    weighted_z = raw_z * (weight ** 2)
+                elif weight > 1.5:
+                    # Emphasized - exponential bonus
+                    weighted_z = raw_z * (weight ** 1.5)
+                else:
+                    # Normal weight - standard linear
+                    weighted_z = raw_z * weight
+
                 # Store both raw and weighted z-scores
                 z_scores[f'z_{cat}_raw'] = raw_z  # For display
-                z_scores[f'z_{cat}'] = raw_z * weight  # For calculation
+                z_scores[f'z_{cat}'] = weighted_z  # For calculation
             else:
                 z_scores[f'z_{cat}_raw'] = 0
                 z_scores[f'z_{cat}'] = 0
@@ -214,6 +256,20 @@ class AuctionValueCalculator:
         # Only sum the weighted z-scores (not the raw ones)
         z_score_cols = [col for col in z_scores.columns if col.startswith('z_') and not col.endswith('_raw')]
         z_scores['total_z'] = z_scores[z_score_cols].sum(axis=1)
+
+        # Add specialist bonus for players who excel in targeted categories
+        # This makes specialists more valuable in punt builds
+        specialist_bonus = 0
+        for cat in self.categories:
+            weight = category_weights.get(cat, default_weight)
+            if weight >= 1.5:  # Highly targeted category
+                raw_col = f'z_{cat}_raw'
+                if raw_col in z_scores.columns:
+                    # Give bonus to players who are elite (z > 1.5) in targeted categories
+                    elite_bonus = z_scores[raw_col].apply(lambda x: max(0, x - 1.5) * 0.5 if x > 1.5 else 0)
+                    specialist_bonus += elite_bonus * weight
+
+        z_scores['total_z'] = z_scores['total_z'] + specialist_bonus
 
         z_scores['position_group'] = df['position_group']
         z_scores['name'] = df['name']
@@ -229,11 +285,19 @@ class AuctionValueCalculator:
     ) -> float:
         total_rostered = league_teams * roster_size
 
-        # Simple approach: replacement level is the last rostered player
+        # Use average of players around the replacement level for stability
         sorted_players = z_scores.sort_values('total_z', ascending=False)
 
-        if len(sorted_players) >= total_rostered:
-            # Replacement level is the player just outside the roster cutoff
+        if len(sorted_players) >= total_rostered + 10:
+            # Take average of players ranked 130-150 (more aggressive replacement level)
+            # This provides more stable replacement level and reduces total VAR
+            start_idx = max(0, total_rostered - 26)  # 130th player (156 - 26)
+            end_idx = min(len(sorted_players), total_rostered - 6)  # 150th player (156 - 6)
+
+            replacement_range = sorted_players.iloc[start_idx:end_idx]['total_z']
+            replacement_level = replacement_range.mean()
+        elif len(sorted_players) >= total_rostered:
+            # Not enough players for averaging, use the traditional method
             replacement_level = sorted_players.iloc[total_rostered]['total_z']
         else:
             # If we don't have enough players, use the last one
@@ -252,15 +316,27 @@ class AuctionValueCalculator:
 
         var_scores[var_scores < 0] = 0
 
-        top_players = int(league_teams * 13)
-        top_var = var_scores.nlargest(top_players)
+        # Boost VAR importance for top 80 players
+        # This increases their share of the value pool
+        sorted_indices = var_scores.nlargest(80).index
+        scaled_var_scores = var_scores.copy()
 
-        total_var = top_var.sum()
+        for idx in sorted_indices:
+            # Apply 1.5x multiplier to top 80 players' VAR
+            scaled_var_scores[idx] = var_scores[idx] * 1.5
+
+        top_players = int(league_teams * 13)
+
+        # Only the top N players get rostered and have real value
+        # Sum VAR only for rosterable players (use scaled values)
+        top_var_scores = scaled_var_scores.nlargest(top_players)
+        total_var = top_var_scores.sum()
         total_dollars = league_teams * budget - top_players
 
         if total_var > 0:
             dollar_per_var = total_dollars / total_var
-            values = var_scores * dollar_per_var + 1
+            # Apply dollar per VAR using scaled VAR scores
+            values = scaled_var_scores * dollar_per_var + 1
         else:
             values = pd.Series(1, index=var_scores.index)
 
@@ -295,19 +371,19 @@ class AuctionValueCalculator:
 
             if adp_rank and adp_rank <= roster_spots:
                 # Use a declining curve: more money for top players
-                # Approximate auction values based on typical drafts
+                # Updated for higher top-end values with progressive decline
                 if adp_rank <= 5:
-                    base_value = 55 - (adp_rank - 1) * 3
+                    base_value = 75 - (adp_rank - 1) * 4  # $75, $71, $67, $63, $59
                 elif adp_rank <= 10:
-                    base_value = 43 - (adp_rank - 5) * 4
+                    base_value = 59 - (adp_rank - 5) * 5  # $54, $49, $44, $39, $34
                 elif adp_rank <= 20:
-                    base_value = 23 - (adp_rank - 10) * 1.5
+                    base_value = 34 - (adp_rank - 10) * 2  # $32, $30, $28... down to $14
                 elif adp_rank <= 40:
-                    base_value = 10 - (adp_rank - 20) * 0.3
+                    base_value = 14 - (adp_rank - 20) * 0.4  # $13.6, $13.2... down to $6
                 elif adp_rank <= 80:
-                    base_value = 4 - (adp_rank - 40) * 0.05
+                    base_value = 6 - (adp_rank - 40) * 0.075  # $5.9, $5.8... down to $3
                 elif adp_rank <= 120:
-                    base_value = 2 - (adp_rank - 80) * 0.025
+                    base_value = 3 - (adp_rank - 80) * 0.05  # $2.95, $2.90... down to $1
                 else:
                     base_value = 1
 
@@ -331,19 +407,19 @@ class AuctionValueCalculator:
             adp_rank = df.loc[idx, 'adp_rank'] if 'adp_rank' in df.columns else None
 
             if adp_rank and adp_rank <= 200:
-                # Variable weighting based on ADP rank
+                # Variable weighting based on ADP rank - reduced ADP influence
                 if adp_rank <= 20:
-                    # Top 20: heavily weight ADP (70%)
-                    weight = 0.7
-                elif adp_rank <= 50:
-                    # Top 50: balanced weight (60% ADP)
-                    weight = 0.6
-                elif adp_rank <= 100:
-                    # Top 100: slight ADP preference (50%)
-                    weight = 0.5
+                    # Top 20: 35% ADP weight
+                    weight = 0.35
+                elif adp_rank <= 40:
+                    # Top 40: 20% ADP weight
+                    weight = 0.20
+                elif adp_rank <= 60:
+                    # Top 60: 10% ADP weight
+                    weight = 0.10
                 else:
-                    # Beyond 100: favor z-scores (30% ADP)
-                    weight = 0.3
+                    # Beyond 60: 0% ADP weight (pure z-scores)
+                    weight = 0.0
 
                 # Blend the values
                 blended_value = (adp_values.loc[idx] * weight +
