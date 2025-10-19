@@ -229,3 +229,6 @@ CORS_ORIGINS=http://localhost:3000,https://your-frontend.vercel.app
 # frontend/.env.production
 REACT_APP_API_URL=https://your-backend.railway.app
 ```
+
+## Contributors
+- Marto Skreto
